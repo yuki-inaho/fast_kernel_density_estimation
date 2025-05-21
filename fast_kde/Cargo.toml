@@ -1,0 +1,14 @@
+[package]
+name = "fast_kde"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "fast_kde"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.21.0", features = ["extension-module"] }
+numpy = "0.21.0"
+rayon = "1.10"
