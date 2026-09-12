@@ -1,21 +1,26 @@
 # Fast & Accurate Gaussian Kernel Density Estimation (Rust + Python)
 
-A one-dimensional Gaussian kernel density estimator implemented in Rust and exposed
-to Python through PyO3. It combines **linear binning** with a **K=4 Deriche recursive
-filter** to approximate Gaussian smoothing in time independent of the kernel width,
-following Jeffrey Heer's *"Fast & Accurate Gaussian Kernel Density Estimation"*.
+One- and two-dimensional Gaussian kernel density estimators implemented in Rust and
+exposed to Python through PyO3. They combine **linear binning** with a **K=4 Deriche
+recursive filter** to approximate Gaussian smoothing in time independent of the kernel
+width, following Jeffrey Heer's *"Fast & Accurate Gaussian Kernel Density Estimation"*.
 
 ## Public API
 
-The compiled `fast_kde` module exports two functions:
+The compiled `fast_kde` module exports three functions:
 
 | Function | Returns |
 | :--- | :--- |
 | `kde_deriche(data, bins, sigma)` | `(x_coords, pdf_values)` — bin centres over `[min(data), max(data)]` and the PDF, normalised to integrate to 1 |
 | `kde_mode_deriche(data, bins, sigma)` | `float` — the `x` coordinate where the PDF is maximal |
+| `kde_deriche_2d(data, bins)` | `(x_coords, y_coords, pdf)` — square grid of bin centres and the PDF of shape `(bins, bins)`, where `pdf[i, j]` is the density at `(x_coords[i], y_coords[j])` |
 
-Both raise `ValueError` for fewer than four samples, `bins == 0`, a degenerate bin
-width, or an inconsistent normalisation.
+The 1D functions raise `ValueError` for fewer than four samples, `bins == 0`, a
+degenerate bin width, or an inconsistent normalisation. `kde_deriche_2d` accepts
+`data` shaped `(2, N)` or `(N, 2)` and picks its bandwidth automatically with Scott's
+rule (see below); it validates the shape, the sample count, the bin count and
+finiteness, and raises `ValueError` otherwise. Constant input is allowed and yields a
+normalised point mass, mirroring the 1D behaviour.
 
 ## Requirements
 
@@ -46,7 +51,7 @@ Verify the extension is really built (importing `fast_kde` alone is not enough �
 the source directory would resolve as an empty namespace package):
 
 ```bash
-uv run python -c "import fast_kde; print(fast_kde.kde_deriche, fast_kde.kde_mode_deriche)"
+uv run python -c "import fast_kde; print(fast_kde.kde_deriche, fast_kde.kde_mode_deriche, fast_kde.kde_deriche_2d)"
 ```
 
 ### Optional dependency groups
@@ -72,7 +77,27 @@ mode = fast_kde.kde_mode_deriche(data, 512, 0.2)
 print(x.shape, pdf.shape)          # (512,) (512,)
 print(np.trapezoid(pdf, x))        # ~1.0
 print(mode)                        # location of the density peak
+
+# 2D: data of shape (2, N) or (N, 2); the bandwidth is chosen automatically
+rng = np.random.default_rng(1)
+points = np.vstack([rng.normal(0.0, 1.0, 2_000), rng.normal(0.0, 0.5, 2_000)])
+gx, gy, gpdf = fast_kde.kde_deriche_2d(points, 128)
+
+print(gx.shape, gy.shape, gpdf.shape)  # (128,) (128,) (128, 128)
 ```
+
+### 2D estimator
+
+`kde_deriche_2d` uses a product Gaussian kernel, so the K=4 Deriche filter is applied
+once along every row and once along every column of the binned grid. The bandwidth is
+Scott's rule for a product kernel, `sigma_j = n**(-1/6) * std_j` with `numpy.std(x,
+ddof=1)`: this is the diagonal of the Scott bandwidth matrix. The correlation between
+the axes is deliberately not modelled — as a product kernel it cannot be represented
+by per-axis filtering — but the diagonal choice keeps the *marginals* equal to those
+of the full-covariance Gaussian KDE with the same Scott bandwidth. The grid is padded
+by `0.5 * sigma` on each side, and the bilinear linear-binning rule follows Heer
+(2021, Section 3); samples beyond the outermost node are clamped to that node so no
+weight is lost.
 
 ## Tests
 
@@ -83,7 +108,9 @@ uv run --extra benchmark pytest -q
 The suite checks that the extension is exported at all, that output shapes,
 finiteness, grid monotonicity and PDF normalisation hold, that malformed input is
 rejected, and that the extension agrees with the Numba reference implementation in
-`benchmarks/numba_reference.py` to `rtol=1e-9, atol=1e-12`.
+`benchmarks/numba_reference.py` to `rtol=1e-9, atol=1e-12`. The 2D suite adds toy
+problems for unequal axis variances, strong correlation, uniform-data edges and
+degenerate input, and compares the estimator against a direct product-kernel oracle.
 
 ## Benchmark
 
@@ -119,6 +146,10 @@ rerunning the commands above.
 The Deriche approximation is checked against an exact Gaussian convolution of the
 same binned histogram. The maximum error is below **0.011% of the peak** across
 bandwidths from 1.9 to 37.5 bins, and it does not grow with the bandwidth.
+`kde_deriche_2d` runs the same filter once per axis. It is pinned against a direct
+product-kernel KDE with Scott's per-axis bandwidth (relative L1 below 0.01 on
+uncorrelated data) and, for strongly correlated data, its marginals are pinned
+against the full-covariance Gaussian KDE with the same Scott bandwidth.
 
 `scipy.stats.gaussian_kde` is used as an independent cross-check in the benchmark.
 It evaluates the kernel sum exactly while this library smooths a binned grid, so
@@ -162,3 +193,7 @@ uv build   # produces a platform wheel containing the compiled extension
 
 * **Jeffrey Heer.** "Fast & Accurate Gaussian Kernel Density Estimation." IEEE VIS Short Papers, 2021.
   * [Paper](http://idl.cs.washington.edu/papers/fast-kde)
+* **Rachid Deriche.** "Fast Algorithms for Low-Level Vision." IEEE TPAMI, 1990.
+  * The recursive Gaussian approximation whose poles Heer's equation (2) expands.
+* **Pascal Getreuer.** "A Survey of Gaussian Convolution Algorithms." IPOL, 2013.
+  * Source of the anticausal numerator relation used by the recursive filter.

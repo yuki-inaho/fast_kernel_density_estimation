@@ -9,6 +9,7 @@ must never be imported by library code.
 Public API (matching ``fast_kde``):
     kde_deriche(data, bins, sigma) -> (x_coords, pdf_values)
     kde_mode_deriche(data, bins, sigma) -> float
+    kde_deriche_2d(data, bins) -> (x_coords, y_coords, pdf)
 
 Reference: "Fast & Accurate Gaussian Kernel Density Estimation" — linear
 binning (Section 3) followed by a K=4 Deriche recursive filter (Section 2).
@@ -235,3 +236,144 @@ def kde_mode_deriche(data, bins, sigma):
 
     masked = np.where(finite, pdf_values, -np.inf)
     return float(x_coords[int(np.argmax(masked))])
+
+
+@njit(cache=True, nogil=True)
+def _split_weight(bins, pos):
+    """Return the lower node index and the fraction of the upper node.
+
+    ``pos`` is ``(value - xmin) / bin_width``; node centres sit at ``k + 0.5``.
+    Positions outside the node range are clamped, so the result always has
+    ``index + 1 < bins`` and the two weights sum to one (for ``bins >= 2``).
+    """
+    pos = pos - 0.5
+    last = bins - 1
+    if pos <= 0.0:
+        return 0, 0.0
+    if pos >= last:
+        return bins - 2, 1.0
+    index = int(np.floor(pos))
+    return index, pos - index
+
+
+@njit(cache=True, nogil=True)
+def linear_binning_2d(x, y, xmin, xmax, ymin, ymax, bins):
+    """Bilinear linear binning onto the grid of bin centres (Heer 2021, Sec. 3).
+
+    Each sample is distributed over the four surrounding nodes with weights
+    proportional to the distance to their centres. Samples outside the node
+    range are clamped to the edge nodes so no weight is lost.
+    """
+    if bins == 0:
+        return np.zeros((0, 0), dtype=np.float64)
+    if len(x) == 0:
+        return np.zeros((bins, bins), dtype=np.float64)
+    if bins == 1:
+        return np.full((1, 1), float(len(x)), dtype=np.float64)
+
+    width_x = (xmax - xmin) / bins
+    width_y = (ymax - ymin) / bins
+    if (
+        not np.isfinite(width_x)
+        or width_x <= 0.0
+        or not np.isfinite(width_y)
+        or width_y <= 0.0
+    ):
+        return np.zeros((bins, bins), dtype=np.float64)
+
+    hist = np.zeros((bins, bins), dtype=np.float64)
+    for i in range(len(x)):
+        ix, fx = _split_weight(bins, (x[i] - xmin) / width_x)
+        iy, fy = _split_weight(bins, (y[i] - ymin) / width_y)
+        hist[ix, iy] += (1.0 - fx) * (1.0 - fy)
+        hist[ix, iy + 1] += (1.0 - fx) * fy
+        hist[ix + 1, iy] += fx * (1.0 - fy)
+        hist[ix + 1, iy + 1] += fx * fy
+    return hist
+
+
+def kde_deriche_2d(data, bins):
+    """2D KDE via bilinear binning plus per-axis Deriche filtering.
+
+    ``data`` must have shape ``(2, N)`` or ``(N, 2)``. The bandwidth is Scott's
+    rule for a product kernel, so it is the diagonal of the Scott bandwidth
+    matrix and the two axes are smoothed independently. Returns
+    ``(x_coords, y_coords, pdf)`` with ``pdf[i, j]`` at ``(x_coords[i],
+    y_coords[j])``; the PDF integrates to one over the grid.
+    """
+    data = np.asarray(data, dtype=np.float64)
+
+    if data.ndim != 2 or (data.shape[0] != 2 and data.shape[1] != 2):
+        raise ValueError("Data shape must be either (2, N) or (N, 2).")
+    if data.shape[0] == 2:
+        x = np.ascontiguousarray(data[0], dtype=np.float64)
+        y = np.ascontiguousarray(data[1], dtype=np.float64)
+    else:
+        x = np.ascontiguousarray(data[:, 0], dtype=np.float64)
+        y = np.ascontiguousarray(data[:, 1], dtype=np.float64)
+
+    if len(x) < 4:
+        raise ValueError("Need at least 4 samples for KDE.")
+    if bins == 0:
+        raise ValueError("Number of bins must be greater than 0.")
+    non_finite = int((~np.isfinite(x)).sum() + (~np.isfinite(y)).sum())
+    if non_finite:
+        raise ValueError(
+            f"Input data must be finite; found {non_finite} non-finite value(s)."
+        )
+
+    x_min, x_max = float(np.min(x)), float(np.max(x))
+    y_min, y_max = float(np.min(y)), float(np.max(y))
+
+    # Degenerate input on both axes: a normalised point mass at the centre.
+    if abs(x_max - x_min) < 1e-9 and abs(y_max - y_min) < 1e-9:
+        dx = dy = 1e-9 / bins
+        x_coords = np.array(
+            [x_min + (i + 0.5) * dx for i in range(bins)], dtype=np.float64
+        )
+        y_coords = np.array(
+            [y_min + (i + 0.5) * dy for i in range(bins)], dtype=np.float64
+        )
+        pdf = np.zeros((bins, bins), dtype=np.float64)
+        pdf[bins // 2, bins // 2] = 1.0 / (dx * dy)
+        return x_coords, y_coords, pdf
+
+    f = len(x) ** (-1.0 / 6.0)
+    sigma_x = f * float(np.std(x, ddof=1))
+    sigma_y = f * float(np.std(y, ddof=1))
+
+    # ``max(1e-9)`` keeps the grid width positive when one axis is constant.
+    xmin = x_min - 0.5 * max(sigma_x, 1e-9)
+    xmax = x_max + 0.5 * max(sigma_x, 1e-9)
+    ymin = y_min - 0.5 * max(sigma_y, 1e-9)
+    ymax = y_max + 0.5 * max(sigma_y, 1e-9)
+
+    hist = linear_binning_2d(x, y, xmin, xmax, ymin, ymax, bins)
+
+    width_x = (xmax - xmin) / bins
+    width_y = (ymax - ymin) / bins
+    sigma_x_in_bins = sigma_x * bins / (xmax - xmin)
+    sigma_y_in_bins = sigma_y * bins / (ymax - ymin)
+
+    for i in range(bins):
+        hist[i, :] = deriche_recursive_filter(hist[i, :], sigma_y_in_bins)
+    for j in range(bins):
+        hist[:, j] = deriche_recursive_filter(hist[:, j], sigma_x_in_bins)
+
+    total = float(hist.sum())
+    if abs(total) < 1e-9:
+        if np.any(np.abs(hist) >= 1e-9):
+            raise ValueError(
+                "Normalization factor is near zero despite non-zero filtered "
+                "histogram sum."
+            )
+    else:
+        hist = hist / (total * width_x * width_y)
+
+    x_coords = np.array(
+        [xmin + (i + 0.5) * width_x for i in range(bins)], dtype=np.float64
+    )
+    y_coords = np.array(
+        [ymin + (i + 0.5) * width_y for i in range(bins)], dtype=np.float64
+    )
+    return x_coords, y_coords, hist
