@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "fast-kernel-density-estimation"
 version = "0.1.0"
-description = "Fast one-dimensional Gaussian KDE using a Deriche recursive filter"
+description = "Fast one- and two-dimensional Gaussian KDE using a Deriche recursive filter"
 readme = "README.md"
 requires-python = ">=3.10.6"
 dependencies = [
